@@ -259,11 +259,11 @@ class DriverAssistanceSim:
         Returns meters: B1_left, B2_right, B3_ang_left, B4_ang_right
         """
         if max_range is None:
-            max_range = self.max_range
+            max_range = self.max_range /1.5
 
-        BEAM_Z = 0.08
-        GAP = 0.38          # inside Husky width (0.55 m)
-        ANG = math.radians(20)  # 20° for angled beams
+        BEAM_Z = 0.05
+        GAP = 0.34          # inside Husky width (0.55 m)
+        ANG = math.radians(15)  # 15° for angled beams
 
         base = [robot_pos[0], robot_pos[1], BEAM_Z]
         _, orn = p.getBasePositionAndOrientation(self.robot_id)
@@ -402,39 +402,67 @@ class DriverAssistanceSim:
         return np.array([b1,b2,b3,b4,beam_dist, left_score, right_score, lane_offset, heading_error], dtype=np.float32)
 
 
-    def compute_reward(self, state, action):
-        beam = state[4]
-        left_str_beam = state[0]
-        right_str_beam = state[1]
-        left_ang = state[2]
-        right_ang = state[3]
+    def compute_reward(self, state, action, done):
+        # unpack state
+        b1, b2, b3, b4 = state[0], state[1], state[2], state[3]
+        beam_dist      = state[4]        # front safety 0–1
+        left_score     = state[5]
+        right_score    = state[6]
+        lane_offset    = abs(state[7])
+        heading_error  = abs(state[8])
 
         reward = 0.0
 
-        if beam < (1.0/self.max_range):
-            reward -= 5  # obstacle too near
-        if left_str_beam == 1 and right_str_beam== 1 and action==0:
-            reward+=4
-        elif left_ang==1 and left_str_beam==1 and action==1:
-            reward+=4   
-        elif right_ang==1 and right_str_beam==1 and action==2:
-            reward+=4
+        # -----------------------------------------
+        # 1) Forward progress reward
+        # -----------------------------------------
+        reward += 3.0 * beam_dist        # straight driving when front is clear
 
-        # if action == 1 and left:
-        #     reward += 1  # good left turn
-        # if action == 2 and right:
-        #     reward += 1  # good right turn
+        # -----------------------------------------
+        # 2) Lane keeping reward
+        # -----------------------------------------
+        reward += 4.0 * (1.0 - lane_offset)
 
-        if action == 0:
-            reward += 0.5  # small reward for going straight
+        # -----------------------------------------
+        # 3) Obstacle avoidance using beams
+        # -----------------------------------------
+        min_beam = min(b1, b2, b3, b4)
+        reward -= 6.0 * (1.0 - min_beam)     # penalty only proportional and bounded
 
-        pos, _ = p.getBasePositionAndOrientation(self.robot_id)
-        
-        if abs(pos[1]) > self.lane_width:  # robot outside lane
-            reward -= 5
-            print("Lane crossed! Penalty applied")
+        # -----------------------------------------
+        # 4) Heading stability
+        # -----------------------------------------
+        reward += 1.5 * (1.0 - heading_error)
 
+        # -----------------------------------------
+        # 5) Action–sensor consistency  (MOST IMPORTANT PART)
+        # -----------------------------------------
+        left_clear  = (b1 + b3) + left_score
+        right_clear = (b2 + b4) + right_score
+
+        if action == 0:      # GO STRAIGHT
+            reward += 2.0 if min(b1, b2) > 0.35 else -2.0   # only if space ahead
+
+        elif action == 1:    # TURN LEFT
+            reward += left_clear - right_clear  # positive only when left safer
+
+        elif action == 2:    # TURN RIGHT
+            reward += right_clear - left_clear  # positive only when right safer
+
+        # -----------------------------------------
+        # 6) Terminal penalty (only once)
+        # -----------------------------------------
+        if done:
+            reward -= 60     # collision OR lane exit
+
+        # -----------------------------------------
+        # 7) Safety clamp to stabilize PPO
+        # -----------------------------------------
+        reward = float(np.clip(reward, -8.0, +8.0))
         return reward
+
+
+
     
     def spawn_cars(self, car_count):
         for _ in range(car_count):
@@ -506,7 +534,7 @@ class DriverAssistanceSim:
 
                 # Map actions to wheel speeds
                 if action == 0: # go straight 
-                    self.set_robot_wheel_velocities(7, reset_angle)
+                    self.set_robot_wheel_velocities(6, reset_angle)
                     reset_angle = 0  # reset angle for straight
                 elif action == 1: # turn left
                     self.set_robot_wheel_velocities(3, +self.ang_vel)
@@ -524,17 +552,15 @@ class DriverAssistanceSim:
                     cameraTargetPosition=robot_pos  # camera follows robot
                 )
 
+                # Terminal condition
+                done = ((state[4] < (0.5/self.max_range)) or (abs(pos[1]) > (self.lane_width + self.offset)))
+
                 # Step 3. Compute reward
-                reward = self.compute_reward(state, action)
+                reward = self.compute_reward(state, action,done)
                 episode_reward += reward
 
                 print("Episode = ",ep , "Step =", step, " State =", state, " Action =", action, " LogProb =", logprob, " Reward =", reward, "total_reward =", episode_reward)
 
-                # Terminal condition
-                done = ((state[4] < (0.5/self.max_range)) or (abs(pos[1]) > (self.lane_width + self.offset)))
-
-                if done:
-                    reward-=100
                 # Step 4. Store (s, a, logprob, r, done) in PPO memory
                 agent.remember(state, action, logprob, reward, done)
 
