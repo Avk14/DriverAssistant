@@ -41,7 +41,7 @@ class PPOActorCritic(nn.Module):
 class PPOAgent:
     def __init__(
         self,
-        state_dim=5,
+        state_dim=9,
         action_dim=3,
         lr=1e-3,
         gamma=0.99,

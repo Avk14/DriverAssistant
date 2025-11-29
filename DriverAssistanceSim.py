@@ -251,6 +251,71 @@ class DriverAssistanceSim:
         plt.axis('off')
         plt.show()
 
+    def four_parallel_robot_beams(self, robot_pos, max_range=None):
+        """
+        4 robot-aligned beams:
+        - 2 forward inside robot width
+        - 2 angled beams (±20°)
+        Returns meters: B1_left, B2_right, B3_ang_left, B4_ang_right
+        """
+        if max_range is None:
+            max_range = self.max_range
+
+        BEAM_Z = 0.08
+        GAP = 0.38          # inside Husky width (0.55 m)
+        ANG = math.radians(20)  # 20° for angled beams
+
+        base = [robot_pos[0], robot_pos[1], BEAM_Z]
+        _, orn = p.getBasePositionAndOrientation(self.robot_id)
+        yaw = p.getEulerFromQuaternion(orn)[2]
+
+        fx = math.cos(yaw);  fy = math.sin(yaw)
+        px = -math.sin(yaw); py = math.cos(yaw)
+
+        # ---- 2 inside-width beam start points ----
+        left_start  = [base[0] + px * (-GAP/2), base[1] + py * (-GAP/2), BEAM_Z]
+        right_start = [base[0] + px * (+GAP/2), base[1] + py * (+GAP/2), BEAM_Z]
+
+        # ---- 2 angled directions ----
+        fx_L = math.cos(yaw + ANG);  fy_L = math.sin(yaw + ANG)
+        fx_R = math.cos(yaw - ANG);  fy_R = math.sin(yaw - ANG)
+
+        starts = [
+            left_start, right_start, base, base
+        ]
+        ends = [
+            [left_start[0]  + fx * max_range, left_start[1]  + fy * max_range, BEAM_Z],   # B1 center-left
+            [right_start[0] + fx * max_range, right_start[1] + fy * max_range, BEAM_Z],   # B2 center-right
+            [base[0]        + fx_L * max_range, base[1]        + fy_L * max_range, BEAM_Z], # B3 angled-left
+            [base[0]        + fx_R * max_range, base[1]        + fy_R * max_range, BEAM_Z]  # B4 angled-right
+        ]
+
+        results = p.rayTestBatch(starts, ends)
+        car_ids = [c['id'] for c in self.cars]
+
+        distances = []
+        debug_ids = self.clear_debug_lines()
+
+        for i, res in enumerate(results):
+            hit = res[0]
+            frac = res[2]
+            dist = frac * max_range if hit in car_ids else max_range
+            distances.append(dist)
+
+            endp = [
+                starts[i][0] + (ends[i][0] - starts[i][0]) * frac,
+                starts[i][1] + (ends[i][1] - starts[i][1]) * frac,
+                BEAM_Z
+            ]
+            color = [1,0,1] if dist < max_range else [0,1,1]
+            lid = p.addUserDebugLine(starts[i], endp, color, 2 if i < 2 else 1, 0)
+            debug_ids.append(lid)
+
+        globals()['debug_line_ids'] = debug_ids
+        return distances[0], distances[1], distances[2], distances[3]
+
+
+
     def beam_sensor(self, robot_pos, z_offset=0.1, max_range=5):
         r_pos = [robot_pos[0], robot_pos[1], z_offset]
 
@@ -299,6 +364,16 @@ class DriverAssistanceSim:
         return np.mean(gray) > threshold  # True = path is clear
 
     def get_state(self, robot_pos):
+
+        b1_left, b2_right, b3_angL, b4_angR = self.four_parallel_robot_beams(robot_pos)
+
+        # normalize 0..1
+        b1 = b1_left / self.max_range
+        b2 = b2_right / self.max_range
+        b3 = b3_angL / self.max_range
+        b4 = b4_angR / self.max_range
+
+
         # Beam-based obstacle detection
         hit_x, hit_y, angle = self.beam_sensor(robot_pos, z_offset=self.z_offset, max_range=self.max_range)
         if hit_x == 0 and hit_y == 0:
@@ -324,18 +399,26 @@ class DriverAssistanceSim:
         yaw = p.getEulerFromQuaternion(orn)[2]
         heading_error = yaw / np.pi   # normalize -1 to 1
 
-        return np.array([beam_dist, left_score, right_score, lane_offset, heading_error], dtype=np.float32)
+        return np.array([b1,b2,b3,b4,beam_dist, left_score, right_score, lane_offset, heading_error], dtype=np.float32)
 
 
     def compute_reward(self, state, action):
-        beam = state[0]
-        left = state[1]
-        right = state[2]
+        beam = state[4]
+        left_str_beam = state[0]
+        right_str_beam = state[1]
+        left_ang = state[2]
+        right_ang = state[3]
 
         reward = 0.0
 
-        if beam < 1.0:
+        if beam < (1.0/self.max_range):
             reward -= 5  # obstacle too near
+        if left_str_beam == 1 and right_str_beam== 1 and action==0:
+            reward+=4
+        elif left_ang==1 and left_str_beam==1 and action==1:
+            reward+=4   
+        elif right_ang==1 and right_str_beam==1 and action==2:
+            reward+=4
 
         # if action == 1 and left:
         #     reward += 1  # good left turn
@@ -423,7 +506,7 @@ class DriverAssistanceSim:
 
                 # Map actions to wheel speeds
                 if action == 0: # go straight 
-                    self.set_robot_wheel_velocities(5, reset_angle)
+                    self.set_robot_wheel_velocities(7, reset_angle)
                     reset_angle = 0  # reset angle for straight
                 elif action == 1: # turn left
                     self.set_robot_wheel_velocities(3, +self.ang_vel)
@@ -448,8 +531,10 @@ class DriverAssistanceSim:
                 print("Episode = ",ep , "Step =", step, " State =", state, " Action =", action, " LogProb =", logprob, " Reward =", reward, "total_reward =", episode_reward)
 
                 # Terminal condition
-                done = ((state[0] < (0.5/self.max_range)) or (abs(pos[1]) > (self.lane_width + self.offset)))
+                done = ((state[4] < (0.5/self.max_range)) or (abs(pos[1]) > (self.lane_width + self.offset)))
 
+                if done:
+                    reward-=100
                 # Step 4. Store (s, a, logprob, r, done) in PPO memory
                 agent.remember(state, action, logprob, reward, done)
 
