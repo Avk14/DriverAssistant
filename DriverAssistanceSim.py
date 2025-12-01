@@ -2,6 +2,7 @@ import pybullet as p
 import pybullet_data
 import time
 import numpy as np
+import csv
 import os
 import math
 import matplotlib.pyplot as plt
@@ -11,7 +12,7 @@ class DriverAssistanceSim:
     def __init__(self):
         self.timeStep = 0.1
         self.num_steps = 500
-        self.max_range = 5
+        self.max_range = 3
         self.z_offset = 0.05
         self.shelf_scale = 0.5
         self.num_cars = 10
@@ -46,7 +47,7 @@ class DriverAssistanceSim:
         self.danger_points = []
 
     def initialize_environment(self):
-        p.connect(p.GUI)
+        p.connect(p.DIRECT)
         p.setGravity(0, 0, -9.8)
         p.setTimeStep(self.timeStep)
         p.setRealTimeSimulation(0)
@@ -146,7 +147,8 @@ class DriverAssistanceSim:
         return globals().get('debug_line_ids', [])
 
     def get_angles(self, r_pos, z_offset, max_range ):
-        angles = np.linspace(-math.pi/3, math.pi/3, 30, endpoint=False)
+        # angles = np.linspace(-math.pi/3, math.pi/3, 30, endpoint=False)
+        angles = np.linspace(-math.radians(30), math.radians(30), 15, endpoint=False)
         from_points = []
         to_points = []
         for a in angles:
@@ -259,11 +261,11 @@ class DriverAssistanceSim:
         Returns meters: B1_left, B2_right, B3_ang_left, B4_ang_right
         """
         if max_range is None:
-            max_range = self.max_range /1.5
+            max_range = self.max_range 
 
-        BEAM_Z = 0.05
-        GAP = 0.34          # inside Husky width (0.55 m)
-        ANG = math.radians(15)  # 15° for angled beams
+        BEAM_Z = 0.1
+        GAP = 0.25          # inside Husky width (0.55 m)
+        ANG = math.radians(15)  # 25° for angled beams
 
         base = [robot_pos[0], robot_pos[1], BEAM_Z]
         _, orn = p.getBasePositionAndOrientation(self.robot_id)
@@ -307,7 +309,7 @@ class DriverAssistanceSim:
                 starts[i][1] + (ends[i][1] - starts[i][1]) * frac,
                 BEAM_Z
             ]
-            color = [1,0,1] if dist < max_range else [0,1,1]
+            color = [1,1,1] if dist < max_range else [0,1,1]
             lid = p.addUserDebugLine(starts[i], endp, color, 2 if i < 2 else 1, 0)
             debug_ids.append(lid)
 
@@ -376,91 +378,108 @@ class DriverAssistanceSim:
 
         # Beam-based obstacle detection
         hit_x, hit_y, angle = self.beam_sensor(robot_pos, z_offset=self.z_offset, max_range=self.max_range)
-        if hit_x == 0 and hit_y == 0:
-            beam_dist = self.max_range
+        # accept only if obstacle is in front region
+        if abs(angle) <= math.radians(30):  
+            if hit_x == 0 and hit_y == 0:
+                beam_dist = self.max_range
+            else:
+                beam_dist = np.linalg.norm(np.array([hit_x, hit_y]) - np.array(robot_pos[:2]))
         else:
-            beam_dist = np.linalg.norm(np.array([hit_x, hit_y]) - np.array(robot_pos[:2]))
+            # Ignore sideways detection → treat as no obstacle
+            beam_dist = self.max_range
         beam_dist = beam_dist / self.max_range   # normalize 0–1
 
-        # Camera clarity scores
-        rgb_left, _, _ = self.get_camera_image(self.robot_id, "left", yaw_offset_deg=90)
-        rgb_right, _, _ = self.get_camera_image(self.robot_id, "right", yaw_offset_deg=-90)
-        imgL = np.reshape(rgb_left, (128,128,4))[:, :, :3].mean() / 255.0
-        imgR = np.reshape(rgb_right, (128,128,4))[:, :, :3].mean() / 255.0
+        # Side closeness (0 = no obstacle, 1 = very close)
+        left_closeness  = (1 - beam_dist) * max(0,  angle)
+        right_closeness = (1 - beam_dist) * max(0, -angle)
 
-        left_score = float(imgL)
-        right_score = float(imgR)
+        # Camera clarity scores
+        # rgb_left, _, _ = self.get_camera_image(self.robot_id, "left", yaw_offset_deg=90)
+        # rgb_right, _, _ = self.get_camera_image(self.robot_id, "right", yaw_offset_deg=-90)
+        # imgL = np.reshape(rgb_left, (128,128,4))[:, :, :3].mean() / 255.0
+        # imgR = np.reshape(rgb_right, (128,128,4))[:, :, :3].mean() / 255.0
+
+        # left_score = float(imgL)
+        # right_score = float(imgR)
 
         # Lane offset
         pos, orn = p.getBasePositionAndOrientation(self.robot_id)
-        lane_offset = pos[1] / (self.lane_width - self.offset)     # normalized -1 to +1
+        lane_offset = pos[1] / (self.lane_width - 0.2)     # normalized -1 to +1
 
         # Heading error (yaw)
         yaw = p.getEulerFromQuaternion(orn)[2]
         heading_error = yaw / np.pi   # normalize -1 to 1
 
-        return np.array([b1,b2,b3,b4,beam_dist, left_score, right_score, lane_offset, heading_error], dtype=np.float32)
+        return np.array([b1,b2,b3,b4,beam_dist, left_closeness, right_closeness, lane_offset, heading_error], dtype=np.float32)
 
 
     def compute_reward(self, state, action, done):
-        # unpack state
         b1, b2, b3, b4 = state[0], state[1], state[2], state[3]
-        beam_dist      = state[4]        # front safety 0–1
-        left_score     = state[5]
-        right_score    = state[6]
-        lane_offset    = abs(state[7])
-        heading_error  = abs(state[8])
+        beam = state[4]
+        left_score = state[5]
+        right_score = state[6]
+
+        left_clear  = (b1 + b3) * 0.5
+        right_clear = (b2 + b4) * 0.5
+        front_clear = beam
 
         reward = 0.0
 
-        # -----------------------------------------
-        # 1) Forward progress reward
-        # -----------------------------------------
-        reward += 3.0 * beam_dist        # straight driving when front is clear
+        if left_score > right_score:
+            if action == 1:
+                reward -= 2
+            elif action == 0 and abs(left_score-right_score)> 0.3:
+                reward -= 1
+        elif right_score > left_score :
+            if action == 2:
+                reward -= 2
+            elif action == 0 and abs(left_score-right_score)> 0.3:  
+                reward -= 1
+        # GO STRAIGHT WHEN CLEAR
+        if front_clear > 0.9 and b1 > 0.9 and b2 > 0.9:
+            reward += 2.0 if action == 0 else -2.0
 
-        # -----------------------------------------
-        # 2) Lane keeping reward
-        # -----------------------------------------
-        reward += 4.0 * (1.0 - lane_offset)
+        # AVOID TURNING INTO DANGER
+        if action == 1:   # LEFT
+            reward += -2.0 if left_clear < right_clear else 3.0 * (left_clear - right_clear)
+        elif action == 2: # RIGHT
+            reward += -2.0 if right_clear < left_clear else 3.0 * (right_clear - left_clear)
 
-        # -----------------------------------------
-        # 3) Obstacle avoidance using beams
-        # -----------------------------------------
-        min_beam = min(b1, b2, b3, b4)
-        reward -= 6.0 * (1.0 - min_beam)     # penalty only proportional and bounded
+        # BOTH SIDES BLOCKED → encourage safer turn
+        if front_clear < 0.6:
+            if left_clear > right_clear and action == 1:
+                reward += 3.0 * (left_clear - right_clear)
+            if right_clear > left_clear and action == 2:
+                reward += 3.0 * (right_clear - left_clear)
 
-        # -----------------------------------------
-        # 4) Heading stability
-        # -----------------------------------------
-        reward += 1.5 * (1.0 - heading_error)
+        # -------- LANE KEEPING (NEW) --------
+        pos = self.get_robot_position(self.robot_id)[0]
+        y = pos[1]
+        road_center_y = 2.0
 
-        # -----------------------------------------
-        # 5) Action–sensor consistency  (MOST IMPORTANT PART)
-        # -----------------------------------------
-        left_clear  = (b1 + b3) + left_score
-        right_clear = (b2 + b4) + right_score
+        distance = y
+        abs_dist = abs(distance)
 
-        if action == 0:      # GO STRAIGHT
-            reward += 2.0 if min(b1, b2) > 0.35 else -2.0   # only if space ahead
+        # reward -= 2.0 * abs_dist       # penalize drifting
+        # if abs_dist > 1.8:             # near boundary
+        #     reward -= 8.0              # heavy penalty
 
-        elif action == 1:    # TURN LEFT
-            reward += left_clear - right_clear  # positive only when left safer
+        # encourage corrective steering
+        if distance > 1.7 and action == 2: 
+            reward += 2.5
+        elif distance > 1.85 and (action == 1 or action == 0):
+            reward-= 3
+        
+        if distance < -1.7 and action == 1: 
+            reward += 2.5
+        elif distance < -1.85 and (action == 2 or action == 0):
+            reward-= 3
 
-        elif action == 2:    # TURN RIGHT
-            reward += right_clear - left_clear  # positive only when right safer
-
-        # -----------------------------------------
-        # 6) Terminal penalty (only once)
-        # -----------------------------------------
+        # COLLISION / TERMINATION
         if done:
-            reward -= 60     # collision OR lane exit
+            reward -= 40.0
 
-        # -----------------------------------------
-        # 7) Safety clamp to stabilize PPO
-        # -----------------------------------------
-        reward = float(np.clip(reward, -8.0, +8.0))
-        return reward
-
+        return float(np.clip(reward, -12.0, 12.0))
 
 
     
@@ -496,7 +515,14 @@ class DriverAssistanceSim:
 
     def run(self):
         agent = PPOAgent()
-        EPISODES = 30
+        checkpoint_file = "ppo_checkpoint.pth"
+        if os.path.exists(checkpoint_file):
+            agent.load(checkpoint_file)
+            print("Loaded previous PPO checkpoint — training will continue ✔")
+        else:
+            print("No checkpoint found — starting fresh ❗")
+
+        EPISODES = 20
         reward_list = []
 
         for ep in range(EPISODES):
@@ -525,7 +551,58 @@ class DriverAssistanceSim:
                 # PPO ACTION
                 # -------------------
                 # Step 2. Get action from PPO agent, by passing state to policy network
-                action, logprob = agent.act(state)
+                logprob = 0
+                if ep < 10:
+                    b1, b2, b3, b4, front, left_close, right_close, _, _ = state
+
+                    # Interpreting beams: lower → obstacle close
+                    left_block  = (b1 < 0.6) or (b3 < 0.6) or (left_close > 0.25)
+                    right_block = (b2 < 0.6) or (b4 < 0.6) or (right_close > 0.25)
+                    front_block = (front < 0.55) or ((b1 < 0.55) or (b2 < 0.55))
+
+                    road_center_x = 0.0  # example
+                    distance_from_center = self.get_robot_position(self.robot_id)[0][1] - road_center_x
+
+                    if distance_from_center > 1.8:  # too left
+                        action = 2  # turn right
+                    elif distance_from_center < -1.8:  # too right
+                        action = 1  # turn left
+                    elif distance_from_center > 1 and front_block and right_block:
+                        action = 2  # turn right
+                    elif distance_from_center < -1 and front_block and left_block:
+                        action = 1
+                    else:
+                        # action = 0  # safe to go straight
+                        # 1) No obstacles → go straight
+                        if not front_block and not left_block and not right_block:
+                            action = 0  # straight
+
+                        # 2) Front blocked → choose safe side
+                        elif front_block:
+                            if left_block and not right_block:
+                                action = 2  # turn right
+                            elif right_block and not left_block:
+                                action = 1  # turn left
+                            else:
+                                if left_close > right_close:
+                                    action = 2
+                                else :
+                                    action = 1
+                                # action = np.random.choice([1, 2])  # both blocked → random small turn
+
+                        # 3) Front clear but side obstacle
+                        else:
+                            if left_block and not right_block:
+                                action = 2  # move away
+                            elif right_block and not left_block:
+                                action = 1  # move away
+                            elif left_block and right_block:
+                                action = 1 if left_close < right_close else 2
+                            else:
+                                action = 0
+                else:
+                    action, logprob = agent.act(state)
+
 
                 self.trajectory.append((robot_pos[0], robot_pos[1], action))
                 beam = state[0]
@@ -534,7 +611,7 @@ class DriverAssistanceSim:
 
                 # Map actions to wheel speeds
                 if action == 0: # go straight 
-                    self.set_robot_wheel_velocities(6, reset_angle)
+                    self.set_robot_wheel_velocities(4, reset_angle)
                     reset_angle = 0  # reset angle for straight
                 elif action == 1: # turn left
                     self.set_robot_wheel_velocities(3, +self.ang_vel)
@@ -560,6 +637,25 @@ class DriverAssistanceSim:
                 episode_reward += reward
 
                 print("Episode = ",ep , "Step =", step, " State =", state, " Action =", action, " LogProb =", logprob, " Reward =", reward, "total_reward =", episode_reward)
+                
+                # CSV file path
+                csv_file = "episode_logs.csv"
+
+                # Check if file exists to write headers only once
+                # file_exists = os.path.isfile(csv_file)
+
+                # # Open CSV in append mode
+                # with open(csv_file, mode='a', newline='') as file:
+                #     writer = csv.writer(file)
+                    
+                #     # Write header if file doesn't exist
+                #     if not file_exists:
+                #         writer.writerow(["Episode", "Step", "State", "Action", "LogProb", "Reward", "Total_Reward"])
+                    
+                #     # Write row
+                #     writer.writerow([ep, step, state.tolist() if hasattr(state, 'tolist') else state, 
+                #      action.tolist() if hasattr(action, 'tolist') else action, 
+                #      logprob, reward, episode_reward])
 
                 # Step 4. Store (s, a, logprob, r, done) in PPO memory
                 agent.remember(state, action, logprob, reward, done)
