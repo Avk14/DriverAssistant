@@ -255,7 +255,7 @@ class PPOAgent:
         lr=1e-3,
         gamma=0.99,
         clip_eps=0.2,
-        update_epochs=8,
+        update_epochs=32,
         batch_size=64,
         min_batch_size=500,
         entropy_coef=0.01,

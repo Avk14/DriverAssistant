@@ -11,11 +11,11 @@ from PPO import PPOAgent
 class DriverAssistanceSim:
     def __init__(self):
         self.timeStep = 0.1
-        self.num_steps = 500
+        self.num_steps = 300
         self.max_range = 3
         self.z_offset = 0.05
         self.shelf_scale = 0.5
-        self.num_cars = 10
+        self.num_cars = 15
         self.step_size = 0.1 # movement speed
         self.lane_width = 2.0
         self.offset = 0.1
@@ -148,7 +148,10 @@ class DriverAssistanceSim:
 
     def get_angles(self, r_pos, z_offset, max_range ):
         # angles = np.linspace(-math.pi/3, math.pi/3, 30, endpoint=False)
-        angles = np.linspace(-math.radians(30), math.radians(30), 15, endpoint=False)
+
+        _, robot_orn = p.getBasePositionAndOrientation(self.robot_id)
+        robot_yaw = p.getEulerFromQuaternion(robot_orn)[2]
+        angles = robot_yaw + np.linspace(-math.radians(30), math.radians(30), 15, endpoint=False)
         from_points = []
         to_points = []
         for a in angles:
@@ -160,6 +163,7 @@ class DriverAssistanceSim:
             from_points.append(start)
             to_points.append(end)
         return angles, from_points, to_points
+
     
     def get_closest_hit(self, hits_cube):
         # return the closest hit
@@ -264,8 +268,8 @@ class DriverAssistanceSim:
             max_range = self.max_range 
 
         BEAM_Z = 0.1
-        GAP = 0.25          # inside Husky width (0.55 m)
-        ANG = math.radians(15)  # 25° for angled beams
+        GAP = 0.1          # inside Husky width (0.55 m)
+        ANG = math.radians(10)  # 25° for angled beams
 
         base = [robot_pos[0], robot_pos[1], BEAM_Z]
         _, orn = p.getBasePositionAndOrientation(self.robot_id)
@@ -425,6 +429,20 @@ class DriverAssistanceSim:
 
         reward = 0.0
 
+        # ---------------- ANTI-OSCILLATION FIX VARIABLES ----------------
+        if not hasattr(self, "prev_action"):
+            self.prev_action = action
+        SWITCH_PENALTY = 0.6
+        DEAD_ZONE = 0.12
+
+        # ---------------- DEAD ZONE FIX ----------------
+        # if abs(left_clear - right_clear) < DEAD_ZONE:
+        #     if action == 0:       # go straight
+        #         reward += 2.5
+        #     else:                 # turning when almost centered
+        #         reward -= 1.0
+
+        # --- EXISTING REWARD CODE (unchanged) ---
         if left_score > right_score:
             if action == 1:
                 reward -= 2
@@ -435,24 +453,21 @@ class DriverAssistanceSim:
                 reward -= 2
             elif action == 0 and abs(left_score-right_score)> 0.3:  
                 reward -= 1
-        # GO STRAIGHT WHEN CLEAR
-        if front_clear > 0.9 and b1 > 0.9 and b2 > 0.9:
-            reward += 2.0 if action == 0 else -2.0
 
-        # AVOID TURNING INTO DANGER
+        if front_clear > 0.9 and b1 > 0.9 and b2 > 0.9:
+            reward += 0.5 if action == 0 else -2.0
+
         if action == 1:   # LEFT
             reward += -2.0 if left_clear < right_clear else 3.0 * (left_clear - right_clear)
         elif action == 2: # RIGHT
             reward += -2.0 if right_clear < left_clear else 3.0 * (right_clear - left_clear)
 
-        # BOTH SIDES BLOCKED → encourage safer turn
         if front_clear < 0.6:
             if left_clear > right_clear and action == 1:
                 reward += 3.0 * (left_clear - right_clear)
             if right_clear > left_clear and action == 2:
                 reward += 3.0 * (right_clear - left_clear)
 
-        # -------- LANE KEEPING (NEW) --------
         pos = self.get_robot_position(self.robot_id)[0]
         y = pos[1]
         road_center_y = 2.0
@@ -460,26 +475,26 @@ class DriverAssistanceSim:
         distance = y
         abs_dist = abs(distance)
 
-        # reward -= 2.0 * abs_dist       # penalize drifting
-        # if abs_dist > 1.8:             # near boundary
-        #     reward -= 8.0              # heavy penalty
-
-        # encourage corrective steering
         if distance > 1.7 and action == 2: 
             reward += 2.5
         elif distance > 1.85 and (action == 1 or action == 0):
-            reward-= 3
-        
+            reward -= 3
+            
         if distance < -1.7 and action == 1: 
             reward += 2.5
         elif distance < -1.85 and (action == 2 or action == 0):
-            reward-= 3
+            reward -= 3
 
-        # COLLISION / TERMINATION
         if done:
             reward -= 40.0
 
+        # ---------------- SWITCHING PENALTY (ANTI-OSCILLATION) ----------------
+        if action != self.prev_action:
+            reward -= SWITCH_PENALTY
+        self.prev_action = action
+
         return float(np.clip(reward, -12.0, 12.0))
+
 
 
     
@@ -522,7 +537,7 @@ class DriverAssistanceSim:
         else:
             print("No checkpoint found — starting fresh ❗")
 
-        EPISODES = 20
+        EPISODES = 100
         reward_list = []
 
         for ep in range(EPISODES):
@@ -534,9 +549,9 @@ class DriverAssistanceSim:
 
             for step in range(self.num_steps):
                 if step % 100 == 0 and step > 0:
-                    self.spawn_cars(3) # Respawn cars
+                    self.spawn_cars(2) # Respawn cars
                 p.stepSimulation()
-                time.sleep(self.timeStep)
+                time.sleep(0.2)
                 self.move_cars()
 
                 pos, _ = p.getBasePositionAndOrientation(self.robot_id)
@@ -552,7 +567,7 @@ class DriverAssistanceSim:
                 # -------------------
                 # Step 2. Get action from PPO agent, by passing state to policy network
                 logprob = 0
-                if ep < 10:
+                if ep < 25:
                     b1, b2, b3, b4, front, left_close, right_close, _, _ = state
 
                     # Interpreting beams: lower → obstacle close
