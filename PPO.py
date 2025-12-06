@@ -1,15 +1,12 @@
-# PPO.py -- robust replacement
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.distributions as dist
 import numpy as np
 
-# -----------------------
 # PPO NETWORK
-# -----------------------
 class PPOActorCritic(nn.Module):
-    def __init__(self, state_dim=5, action_dim=3):   # adapt state_dim to your get_state()
+    def __init__(self, state_dim=9, action_dim=4): 
         super().__init__()
         self.shared = nn.Sequential(
             nn.Linear(state_dim, 128), nn.ReLU(),
@@ -18,6 +15,21 @@ class PPOActorCritic(nn.Module):
         )
         self.policy = nn.Linear(128, action_dim)
         self.value = nn.Linear(128, 1)
+
+        for m in self.shared.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.uniform_(m.weight, -0.01, 0.01)
+                nn.init.zeros_(m.bias)
+
+        for m in self.policy.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.uniform_(m.weight, -0.01, 0.01)
+                nn.init.zeros_(m.bias)
+
+        for m in self.value.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.uniform_(m.weight, -0.01, 0.01)
+                nn.init.zeros_(m.bias)
 
         # Orthogonal initialization for stability
         for m in self.shared:
@@ -30,29 +42,32 @@ class PPOActorCritic(nn.Module):
         nn.init.constant_(self.value.bias, 0.0)
 
     def forward(self, x):
-        # Expect x shape: (batch, state_dim)
         x = self.shared(x)
         return self.policy(x), self.value(x)
 
 
-# -----------------------
 # PPO AGENT
-# -----------------------
 class PPOAgent:
     def __init__(
         self,
         state_dim=9,
-        action_dim=3,
-        lr=1e-3,
+        action_dim=4,
+        actor_lr=3e-4,
+        critic_lr=1e-3,
         gamma=0.99,
         clip_eps=0.2,
         update_epochs=8,
         batch_size=64,
         min_batch_size=256,
-        entropy_coef=0.01
+        entropy_coef=0.03
     ):
         self.model = PPOActorCritic(state_dim=state_dim, action_dim=action_dim)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        self.optimizer = optim.Adam([
+            {"params": self.model.policy.parameters(), "lr": actor_lr},
+            {"params": self.model.value.parameters(), "lr": critic_lr},
+            {"params": self.model.shared.parameters(), "lr": actor_lr}  # usually shared with actor
+        ])
+
 
         self.gamma = gamma
         self.clip_eps = clip_eps
@@ -60,7 +75,7 @@ class PPOAgent:
         self.batch_size = batch_size
         self.min_batch_size = min_batch_size
         self.entropy_coef = entropy_coef
-
+        self.last_action = None
         self.memory = {"states": [], "actions": [], "logprobs": [], "rewards": [], "dones": []}
 
     # ---------- action selection ----------
@@ -69,7 +84,28 @@ class PPOAgent:
         state_t = torch.FloatTensor(state).unsqueeze(0)  # make batch dim: (1, state_dim)
         logits, _ = self.model(state_t)                  # logits shape: (1, action_dim)
         logits = logits.squeeze(0)                       # shape: (action_dim,)
-        dist_pi = dist.Categorical(logits=logits)
+
+        safe_actions = [0, 1, 2, 3]  # all actions
+        front_dist = state[4]  # front distance
+        left_dist  = state[0]  # left distance
+        right_dist = state[1]  # right distance
+        # print("#################### front dist", front_dist, " left_dist ", left_dist, " right dist ", right_dist)
+
+        if front_dist > 1 - 0.35 and 0 in safe_actions:
+            safe_actions.remove(0)
+        if left_dist > 1 - 0.25 and 1 in safe_actions:
+            safe_actions.remove(1)
+        if right_dist > 1 - 0.25 and 2 in safe_actions:
+            safe_actions.remove(2)
+        if front_dist < 0.4 and 3 in safe_actions:
+            safe_actions.remove(3)
+
+        # Mask logits
+        mask = torch.zeros_like(logits)
+        mask[safe_actions] = 1.0
+        masked_logits = logits + (mask + 1e-8).log()  # avoid log(0)
+
+        dist_pi = dist.Categorical(logits=masked_logits)
         action = dist_pi.sample()
         logprob = dist_pi.log_prob(action)
 
@@ -77,18 +113,24 @@ class PPOAgent:
         return int(action.item()), float(logprob.item())
 
     def remember(self, s, a, lp, r, d):
+        if self.last_action is not None and a == 3 and self.last_action == 3:
+            r -= 0.02
         self.memory["states"].append(np.array(s, dtype=np.float32))
         self.memory["actions"].append(int(a))
         self.memory["logprobs"].append(float(lp))
         self.memory["rewards"].append(float(r))
         self.memory["dones"].append(bool(d))
+        self.last_action = a
 
     # ---------- PPO update ----------
-    def train(self, force=False):
+    def train(self, force=False, entropy_coef=None):
         """
         Runs PPO update. If not enough samples (len(states) < min_batch_size) and not force,
         update is skipped to avoid unstable small-batch updates.
         """
+        if entropy_coef is None:
+            entropy_coef = self.entropy_coef
+
         mem_size = len(self.memory["states"])
         if mem_size == 0:
             print("PPO.train(): memory empty -> nothing to do.")
@@ -114,6 +156,7 @@ class PPOAgent:
             G = r + self.gamma * G
             returns.insert(0, G)
         returns = torch.FloatTensor(returns)  # (N,)
+        returns = (returns - returns.mean()) / (returns.std(unbiased=False) + 1e-8)
 
         # Basic NaN check
         if torch.isnan(states).any() or torch.isnan(returns).any():
@@ -140,6 +183,7 @@ class PPOAgent:
                 # Compute advantages
                 values = values.squeeze(1)                 # (B,)
                 advantages = ret_batch - values            # (B,)
+                critic_loss = 0.5 * (advantages.pow(2).mean())  
 
                 # Robust normalization: avoid divide-by-zero
                 adv_mean = advantages.mean()
@@ -156,7 +200,6 @@ class PPOAgent:
                 surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages
 
                 actor_loss = -torch.min(surr1, surr2).mean()
-                critic_loss = 0.5 * (advantages.pow(2).mean())  # MSE on advantage ~ (returns - value)^2
 
                 loss = actor_loss + critic_loss - self.entropy_coef * entropy
 
@@ -171,4 +214,22 @@ class PPOAgent:
         # Clear memory after update
         self.memory = {k: [] for k in self.memory}
         print("PPO.train(): Update finished. Final loss:", final_loss)
-        return final_loss
+        
+
+        return final_loss, actor_loss, critic_loss, entropy
+
+    def save_model(self, filepath):
+        """Saves the state dictionary of the underlying ActorCritic network."""
+        torch.save(self.model.state_dict(), filepath)
+        print(f"PPOAgent: Model saved successfully to {filepath}")
+
+    def load_model(self, filepath):
+        """Loads the state dictionary into the underlying ActorCritic network."""
+        try:
+            self.model.load_state_dict(torch.load(filepath))
+            print(f"PPOAgent: Model loaded successfully from {filepath}")
+            self.model.eval() # Important for inference
+        except FileNotFoundError:
+            print(f"PPOAgent: Error - Model file not found at {filepath}. Starting from scratch.")
+        except RuntimeError as e:
+            print(f"PPOAgent: Error loading model state dict. Error: {e}")
